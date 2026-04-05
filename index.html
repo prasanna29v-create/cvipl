@@ -2099,11 +2099,15 @@ function MatchPage({match,profile,onNav}){
           <button className={`tab ${tab==='info'?'act':''}`} onClick={()=>setTab('info')}>Info</button>
           {profile?.isAdmin&&!isWc&&<button className={`tab ${tab==='xi_admin'?'act':''}`} 
             style={{color:tab==='xi_admin'?'var(--or)':'var(--or)',fontWeight:600}}
-            onClick={()=>setTab('xi_admin')}>👥 XI</button>}
+            onClick={()=>setTab('xi_admin')}>🔧 Admin Tools</button>}
         </div>
 
         {tab==='board'&&<ErrorBoundary><BoardTab match={match} profile={profile} liveScore={liveScore} isWc={isWc} matchStarted={matchStarted}/></ErrorBoundary>}
-      {tab==='xi_admin'&&profile?.isAdmin&&<div style={{padding:'0 4px'}}><ErrorBoundary><AdminXIMarker match={match} liveScore={liveScore}/></ErrorBoundary></div>}
+      {tab==='xi_admin'&&profile?.isAdmin&&(
+        <ErrorBoundary>
+          <AdminToolsPanel match={match} liveScore={liveScore}/>
+        </ErrorBoundary>
+      )}
         {tab==='scorecard'&&<ErrorBoundary><ScorecardTab match={match} liveScore={liveScore}/></ErrorBoundary>}
         {tab==='stats'&&<ErrorBoundary><StatsTab match={match} liveScore={liveScore} myTeam={myTeam}/></ErrorBoundary>}
         {tab==='myxi'&&<ErrorBoundary><MyXITab match={match} profile={profile} myTeam={myTeam} liveScore={liveScore} locked={locked} loadingTeam={loadingTeam} onNav={onNav} isWc={isWc}/></ErrorBoundary>}
@@ -2118,6 +2122,195 @@ function MatchPage({match,profile,onNav}){
 // Inline editable match title — shown in home card and board header
 // Admin-only edit mode
 // Admin: manually mark playing XI per match with one click
+// ── Admin Tools Panel — XI marking + uploads in match page ───────────────────
+function AdminToolsPanel({match, liveScore}){
+  const[subTab,setSubTab]=useState('mark');
+  return(
+    <div style={{padding:'0 4px'}}>
+      <div className="tabs" style={{marginBottom:8}}>
+        <button className={`tab ${subTab==='mark'?'act':''}`} onClick={()=>setSubTab('mark')}>👥 Mark XI</button>
+        <button className={`tab ${subTab==='xi'?'act':''}`} onClick={()=>setSubTab('xi')}>📋 XI Upload</button>
+        <button className={`tab ${subTab==='sc'?'act':''}`} onClick={()=>setSubTab('sc')}>📥 Scorecard</button>
+      </div>
+      {subTab==='mark'&&<AdminXIMarker match={match} liveScore={liveScore}/>}
+      {subTab==='xi'&&<XIUploadWidget match={match}/>}
+      {subTab==='sc'&&<ScorecardUploadWidget match={match} liveScore={liveScore}/>}
+    </div>
+  );
+}
+
+// ── Inline XI Upload widget for match page ────────────────────────────────────
+function XIUploadWidget({match}){
+  const[raw,setRaw]=useState('');
+  const[saving,setSaving]=useState(false);
+  const[result,setResult]=useState('');
+
+  const apply=async()=>{
+    setSaving(true);setResult('');
+    try{
+      const clean=raw.trim().replace(/^```json\s*/,'').replace(/\s*```$/,'');
+      const obj=JSON.parse(clean);
+      if(!obj.playing||!Array.isArray(obj.playing)) throw new Error('Missing playing array');
+      const xi={};
+      (obj.playing||[]).forEach(name=>{xi[canonicalName(name)]='playing';});
+      (obj.impact||[]).forEach(name=>{xi[canonicalName(name)]='impact';});
+      [match.home,match.away].forEach(team=>{
+        (IPL_SQUADS[team]||[]).forEach(p=>{if(!xi[p.name]) xi[p.name]='bench';});
+      });
+      await db.collection('live_scores').doc(match.id).set(
+        {startingXI:xi,squadPullTime:new Date().toISOString(),xiSource:'upload',
+         updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+      const playing=Object.entries(xi).filter(([,v])=>v==='playing').map(([k])=>k);
+      const bench=Object.entries(xi).filter(([,v])=>v==='bench').map(([k])=>k);
+      const entry={at:new Date().toISOString(),playersFound:Object.keys(xi).length,
+        playing,bench,impact:(obj.impact||[]).map(n=>canonicalName(n)),source:'upload'};
+      const prev=(await db.collection('live_scores').doc(match.id).get().catch(()=>({data:()=>({})}))).data()||{};
+      await db.collection('live_scores').doc(match.id).set(
+        {xiPullLog:entry,xiPullHistory:[...(prev.xiPullHistory||[]).slice(-7),entry]},{merge:true});
+      setResult('✅ '+playing.length+' playing · '+bench.length+' bench saved');
+      setRaw('');
+    }catch(e){setResult('❌ '+e.message);}
+    setSaving(false);
+  };
+
+  const PROMPT=`Paste this into ChatGPT with the playing XI:\n{\n  "matchId":"${match.id}",\n  "home":"${match.home}","away":"${match.away}",\n  "playing":["Full Name 1","Full Name 2",...all 22 who played],\n  "impact":[]\n}`;
+
+  return(
+    <div>
+      <div style={{fontSize:10,color:'var(--t3)',marginBottom:6,lineHeight:1.5}}>
+        Paste JSON with playing XI. Format: {"{"}"playing":["Name1","Name2",...],"impact":[]{"}"}<br/>
+        <span style={{color:'var(--or)'}}>ChatGPT prompt: extract playing XI and return JSON with playing[] array of full names.</span>
+      </div>
+      <textarea style={{width:'100%',minHeight:120,background:'rgba(0,0,0,.3)',border:'1px solid var(--border)',
+        borderRadius:8,padding:8,fontFamily:'monospace',fontSize:9,color:'var(--t1)',
+        resize:'vertical',boxSizing:'border-box'}}
+        placeholder={'{"playing":["Ruturaj Gaikwad","Devon Conway",...],"impact":[]}'}
+        value={raw} onChange={e=>setRaw(e.target.value)}
+      />
+      <div style={{display:'flex',gap:8,marginTop:6}}>
+        <button className="btn bor bsm" disabled={saving||!raw.trim()} onClick={apply}>
+          {saving?<><span className="spin"/> Saving...</>:'✅ Apply XI'}
+        </button>
+        <button className="btn bghost bsm" onClick={()=>{setRaw('');setResult('');}}>Clear</button>
+      </div>
+      {result&&<div style={{fontSize:10,marginTop:6,color:result.startsWith('✅')?'var(--green)':'var(--red)',fontWeight:600}}>{result}</div>}
+    </div>
+  );
+}
+
+// ── Inline Scorecard Upload widget for match page ─────────────────────────────
+function ScorecardUploadWidget({match, liveScore}){
+  const[raw,setRaw]=useState('');
+  const[applying,setApplying]=useState(false);
+  const[result,setResult]=useState('');
+
+  const apply=async()=>{
+    setApplying(true);setResult('');
+    try{
+      const clean=raw.trim().replace(/^```json\s*/,'').replace(/\s*```$/,'');
+      const obj=JSON.parse(clean);
+      if(!obj.innings||!Array.isArray(obj.innings)) throw new Error('Missing innings array');
+      const existingPtsMap={...(liveScore?.ptsMap||{})};
+      let dots=0,fielding=0;
+      obj.innings.forEach(inn=>{
+        // Dismissals → fielding credits
+        (inn.batting||[]).forEach(b=>{
+          if(!b.dismissal) return;
+          const dis=parseDismissal(b.dismissal);
+          if(!dis.fielder||dis.type==='notout'||dis.type==='other') return;
+          const fn=dis.fielder;
+          if(!existingPtsMap[fn]) existingPtsMap[fn]={name:fn,pts:4,role:'AR',team:inn.team,bd:{'Playing XI':4},field:{c:0,st:0,ro:0}};
+          if(!existingPtsMap[fn].field) existingPtsMap[fn].field={c:0,st:0,ro:0};
+          let fp=0,fk='';
+          if(dis.type==='catch'){fp=8;fk='Catch';existingPtsMap[fn].field.c=(existingPtsMap[fn].field.c||0)+1;}
+          else if(dis.type==='stumping'){fp=12;fk='Stumping';existingPtsMap[fn].field.st=(existingPtsMap[fn].field.st||0)+1;}
+          else if(dis.type==='runout'){fp=dis.directHit?12:6;fk=dis.directHit?'Run Out (Direct)':'Run Out';existingPtsMap[fn].field.ro=(existingPtsMap[fn].field.ro||0)+1;}
+          if(fp>0){existingPtsMap[fn].pts=Math.round((existingPtsMap[fn].pts+fp)*10)/10;existingPtsMap[fn].bd[fk]=(existingPtsMap[fn].bd[fk]||0)+fp;fielding++;}
+        });
+        // Dot balls → bowler pts
+        (inn.bowling||[]).forEach(bw=>{
+          if(typeof bw.dots!=='number') return;
+          const name=canonicalName(bw.name);
+          if(!name) return;
+          if(!existingPtsMap[name]) existingPtsMap[name]={name,pts:4,role:'BOWL',team:inn.team,bd:{'Playing XI':4},bowl:{o:0,rc:0,w:0,m:0,d:0}};
+          if(!existingPtsMap[name].bowl) existingPtsMap[name].bowl={o:0,rc:0,w:0,m:0,d:0};
+          const old=existingPtsMap[name].bowl.d||0;
+          if(bw.dots===old) return;
+          const diff=bw.dots-old;
+          existingPtsMap[name].bowl.d=bw.dots;
+          existingPtsMap[name].pts=Math.round((existingPtsMap[name].pts+diff)*10)/10;
+          existingPtsMap[name].bd[`Dots(${bw.dots})`]=(existingPtsMap[name].bd[`Dots(${bw.dots})`]||0)+diff;
+          if(old>0) delete existingPtsMap[name].bd[`Dots(${old})`];
+          dots++;
+        });
+      });
+      // 3-catch bonus
+      Object.values(existingPtsMap).forEach(p=>{
+        if(p.field&&(p.field.c||0)>=3&&!p.bd['3 Catch Bonus']){
+          p.pts=Math.round((p.pts+4)*10)/10;p.bd['3 Catch Bonus']=4;
+        }
+      });
+      await db.collection('live_scores').doc(match.id).set(
+        {ptsMap:existingPtsMap,lastUpload:new Date().toISOString(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},
+        {merge:true});
+      // Recompute match_pts
+      const teamsSnap=await db.collection('teams').where('matchId','==',match.id).get();
+      if(!teamsSnap.empty){
+        const batch=db.batch();
+        teamsSnap.forEach(tdoc=>{
+          const team=tdoc.data();
+          if(!team.cvplId&&!team.userId) return;
+          let total=0;
+          const detail=(team.players||[]).map(p=>{
+            const res=normalizeName(p.name,Object.keys(existingPtsMap));
+            const cp=res?existingPtsMap[res]:null;
+            const base=cp?cp.pts:0;
+            const mult=p.isC?2:p.isVC?1.5:1;
+            const final=Math.round(base*mult*10)/10;
+            total+=final;
+            return{name:String(p.name),role:String(p.role||'BAT'),base,mult,final};
+          });
+          total=Math.round(total*10)/10;
+          batch.set(db.collection('match_pts').doc(match.id+'_'+(team.cvplId||team.userId)),{
+            matchId:String(match.id),cvplId:String(team.cvplId||''),
+            cvplName:String(team.cvplName||''),cvplEmoji:String(team.cvplEmoji||'🏏'),
+            pts:total,detail,calculatedAt:firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+        await batch.commit();
+      }
+      await updatePlayerStatsFromPtsMap(match.id,match.date,existingPtsMap,true);
+      await loadPlayerStats();
+      setResult(`✅ Dots: ${dots} bowlers · Fielding: ${fielding} credits · Teams recomputed`);
+      setRaw('');
+    }catch(e){setResult('❌ '+e.message);}
+    setApplying(false);
+  };
+
+  return(
+    <div>
+      <div style={{fontSize:10,color:'var(--t3)',marginBottom:6,lineHeight:1.5}}>
+        Paste ChatGPT JSON with dot balls (bowling) + dismissals (batting).<br/>
+        <span style={{color:'var(--or)'}}>Adds dots/fielding to existing pts and recomputes all team scores.</span>
+      </div>
+      <textarea style={{width:'100%',minHeight:140,background:'rgba(0,0,0,.3)',border:'1px solid var(--border)',
+        borderRadius:8,padding:8,fontFamily:'monospace',fontSize:9,color:'var(--t1)',
+        resize:'vertical',boxSizing:'border-box'}}
+        placeholder={'{"matchId":"m09","innings":[{"team":"GT","batting":[{"name":"Shubman Gill","dismissal":"c Sanju Samson b Yuzvendra Chahal"}],"bowling":[{"name":"Yuzvendra Chahal","dots":14}]}]}'}
+        value={raw} onChange={e=>setRaw(e.target.value)}
+      />
+      <div style={{display:'flex',gap:8,marginTop:6}}>
+        <button className="btn bor bsm" disabled={applying||!raw.trim()} onClick={apply}>
+          {applying?<><span className="spin"/> Applying...</>:'✅ Apply Scorecard'}
+        </button>
+        <button className="btn bghost bsm" onClick={()=>{setRaw('');setResult('');}}>Clear</button>
+      </div>
+      {result&&<div style={{fontSize:10,marginTop:6,color:result.startsWith('✅')?'var(--green)':'var(--red)',fontWeight:600}}>{result}</div>}
+    </div>
+  );
+}
+
+
 function AdminXIMarker({match, liveScore}){
   const[saving,setSaving]=useState('');
   const teams=[match.home,match.away];
@@ -2197,21 +2390,21 @@ function AdminXIMarker({match, liveScore}){
           borderRadius:8,padding:'6px 10px',cursor:'pointer',fontSize:10,fontWeight:700,
           color:'var(--cyan)',width:'100%',textAlign:'left'
         }}>
-          📡 Raw API Response {doc?.xiRawPull?`(${doc.xiRawPull.playerCount||0} players found)`:'(no data yet)'}
+          📡 Raw API Response {rawDoc?`(${rawDoc.playerCount||0} players found)`:'(no data yet)'}
           {' '}{showRaw?'▲':'▼'}
         </button>
         {showRaw&&rawDoc&&(
           <div style={{background:'rgba(0,0,0,.4)',borderRadius:8,padding:'10px',marginTop:4,
             fontSize:9,fontFamily:'monospace',color:'#a0aec0',maxHeight:300,overflowY:'auto'}}>
             <div style={{color:'#68d391',fontWeight:700,marginBottom:4}}>
-              Pulled: {doc.xiRawPull.at?new Date(doc.xiRawPull.at).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'?'} IST
-              {' · '}Status: {doc.xiRawPull.status||'?'}
-              {' · '}{doc.xiRawPull.playingCount||0} playing, {doc.xiRawPull.playerCount||0} total
+              Pulled: {rawDoc.at?new Date(rawDoc.at).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'?'} IST
+              {' · '}Status: {rawDoc.status||'?'}
+              {' · '}{rawDoc.playingCount||0} playing, {rawDoc.playerCount||0} total
             </div>
-            {doc.xiRawPull.teamInfo&&(
+            {rawDoc.teamInfo&&(
               <div style={{marginBottom:6}}>
                 <div style={{color:'#fc8181',fontWeight:700,marginBottom:2}}>teamInfo:</div>
-                {JSON.parse(doc.xiRawPull.teamInfo||'[]').map((t,i)=>(
+                {JSON.parse(rawDoc.teamInfo||'[]').map((t,i)=>(
                   <div key={i} style={{marginBottom:4}}>
                     <div style={{color:'#fbd38d'}}>{t.name} ({t.players?.length||0} players):</div>
                     {(t.players||[]).map(p=>(
@@ -2225,25 +2418,25 @@ function AdminXIMarker({match, liveScore}){
                 ))}
               </div>
             )}
-            {doc.xiRawPull.playing11&&JSON.parse(doc.xiRawPull.playing11||'[]').length>0&&(
+            {rawDoc.playing11&&JSON.parse(rawDoc.playing11||'[]').length>0&&(
               <div>
                 <div style={{color:'#fc8181',fontWeight:700,marginBottom:2}}>playing11 array:</div>
-                {JSON.parse(doc.xiRawPull.playing11).map((p,i)=>(
+                {JSON.parse(rawDoc.playing11).map((p,i)=>(
                   <div key={i} style={{paddingLeft:8}}>{p.name||String(p)}</div>
                 ))}
               </div>
             )}
-            {doc.xiRawPull.parsedXI&&(
+            {rawDoc.parsedXI&&(
               <div style={{marginTop:6}}>
                 <div style={{color:'#fc8181',fontWeight:700,marginBottom:2}}>Parsed XI saved:</div>
                 <div style={{color:'#68d391'}}>
-                  {Object.entries(JSON.parse(doc.xiRawPull.parsedXI||'{}')).map(([n,s])=>`${s==='playing'?'✅':s==='impact'?'⚡':'❌'} ${n}`).join(' · ')}
+                  {Object.entries(JSON.parse(rawDoc.parsedXI||'{}')).map(([n,s])=>`${s==='playing'?'✅':s==='impact'?'⚡':'❌'} ${n}`).join(' · ')}
                 </div>
               </div>
             )}
           </div>
         )}
-        {showRaw&&!doc?.xiRawPull&&(
+        {showRaw&&!rawDoc&&(
           <div style={{padding:'8px',fontSize:10,color:'var(--t3)',textAlign:'center'}}>
             No XI pull data yet for this match. Pulls auto at 7:10, 7:12, 7:15, 7:20 PM or use 👥 XI button.
           </div>
@@ -2596,15 +2789,60 @@ function BoardTab({match,profile,liveScore,isWc,matchStarted}){
           {loading?(
             <div style={{textAlign:'center',padding:24}}><span className="spin"/></div>
           ):scoredTeams.length===0?(
-            <div className="empty" style={{padding:'16px 0'}}>
-              <div style={{fontSize:32}}>📡</div>
-              <div style={{fontSize:13,fontWeight:600}}>Waiting for first pts compute</div>
-              <div style={{fontSize:11,color:'var(--t3)',marginTop:4}}>
-                Scores pull every 10 min · Pts computed at match end
-              </div>
-              <div style={{fontSize:10,color:'var(--t3)',marginTop:4}}>
-                {submittedTeams.length} team{submittedTeams.length!==1?'s':''} submitted
-              </div>
+            <div>
+              {/* Live running pts from ptsMap during match */}
+              {liveScore?.ptsMap&&Object.keys(liveScore.ptsMap).length>0&&submittedTeams.length>0?(
+                <div>
+                  <div style={{fontSize:10,color:'var(--or)',marginBottom:6,fontStyle:'italic'}}>
+                    ⚡ Live estimates (final pts computed at match end)
+                  </div>
+                  {submittedTeams
+                    .map(t=>{
+                      const ptsMapKeys=Object.keys(liveScore.ptsMap);
+                      let livePts=0;
+                      (t.players||[]).forEach(p=>{
+                        const res=normalizeName(p.name,ptsMapKeys);
+                        const cp=res?liveScore.ptsMap[res]:null;
+                        const base=cp?cp.pts:0;
+                        const mult=p.isC?2:p.isVC?1.5:1;
+                        livePts+=Math.round(base*mult*10)/10;
+                      });
+                      return{...t,livePts:Math.round(livePts*10)/10};
+                    })
+                    .sort((a,b)=>b.livePts-a.livePts)
+                    .map((t,i)=>{
+                      const isMe=t.userId===profile.id||t.cvplId===profile.cvplId;
+                      return(
+                        <div key={t.cvplId||t.userId} className={`lbr ${i===0?'r1':i===1?'r2':i===2?'r3':''} ${isMe?'me':''}`}
+                          style={{cursor:'default'}}>
+                          <div className="lrank">{i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1}</div>
+                          <div style={{fontSize:18,flexShrink:0}}>{t.cvplEmoji||'🏏'}</div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:isMe?800:600,fontSize:14}}>
+                              {t.cvplName||'?'}{isMe&&<span style={{color:'var(--or)',fontSize:10,marginLeft:4}}>YOU</span>}
+                            </div>
+                            <div style={{fontSize:10,color:'var(--t3)'}}>
+                              C: {(t.players||[]).find(p=>p.isC)?.name||'?'}
+                            </div>
+                          </div>
+                          <div style={{fontSize:22,fontWeight:800,color:'var(--or)'}}>{t.livePts}</div>
+                        </div>
+                      );
+                    })
+                  }
+                </div>
+              ):(
+                <div className="empty" style={{padding:'16px 0'}}>
+                  <div style={{fontSize:32}}>📡</div>
+                  <div style={{fontSize:13,fontWeight:600}}>Waiting for first score update</div>
+                  <div style={{fontSize:11,color:'var(--t3)',marginTop:4}}>
+                    Scores pull every 10 min · Live pts will show shortly
+                  </div>
+                  <div style={{fontSize:10,color:'var(--t3)',marginTop:4}}>
+                    {submittedTeams.length} team{submittedTeams.length!==1?'s':''} submitted
+                  </div>
+                </div>
+              )}
             </div>
           ):(
             <div>
@@ -3639,15 +3877,13 @@ function Step1({match,all,sel,setSel,cap,setCap,vc,setVc,validate,onNext,isWc,st
                   {xiStatus==='impact'&&<span style={{fontSize:9,color:'var(--or)',fontWeight:600}}>⚡</span>}
                 </div>
               </div>
-              <div style={{minWidth:32,textAlign:'center',flexShrink:0}}>
-                {p.matchCount>0
-                  ?<div style={{fontSize:11,fontWeight:800,lineHeight:1,
-                      color:p.totalPts>=100?'var(--green)':p.totalPts>=50?'var(--or)':'var(--t3)'}}>
-                      {p.totalPts}
-                    </div>
-                  :<div style={{fontSize:8,fontWeight:700,color:'var(--t3)',lineHeight:1}}>DNP</div>
-                }
-                <div style={{fontSize:16,color:inXI?'var(--or)':'var(--border2)',lineHeight:1.2}}>{inXI?'✓':'+'}</div>
+              <div style={{minWidth:38,textAlign:'center',flexShrink:0}}>
+                <div style={{fontSize:13,fontWeight:800,lineHeight:1,
+                    color:p.totalPts>=100?'var(--green)':p.totalPts>=50?'var(--or)':p.totalPts>0?'var(--t2)':'var(--t3)'}}>
+                  {p.totalPts>0?p.totalPts:'–'}
+                </div>
+                {p.matchCount>0&&<div style={{fontSize:8,color:'var(--t3)',lineHeight:1.4}}>{p.matchCount}g</div>}
+                <div style={{fontSize:14,color:inXI?'var(--or)':'var(--border2)',lineHeight:1}}>{inXI?'✓':'+'}</div>
               </div>
             </div>
           );
